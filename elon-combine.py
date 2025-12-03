@@ -103,13 +103,15 @@ class ElonAnalyticsEngine:
             else:
                 # 2. Handle "May 15, 10:00 PM" format (Missing Year)
                 try:
-                    dt_naive = datetime.strptime(clean_str, '%b %d, %I:%M:%S %p')
                     current_year = datetime.now().year
                     
-                    # Try current year
-                    dt = dt_naive.replace(year=current_year)
+                    # Append current year to string to avoid DeprecationWarning for parsing without year
+                    # Format becomes "May 15, 10:00 PM, 2025"
+                    temp_str = f"{clean_str}, {current_year}"
+                    dt_naive = datetime.strptime(temp_str, '%b %d, %I:%M:%S %p, %Y')
+                    
                     est_tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
-                    dt = dt.replace(tzinfo=est_tz)
+                    dt = dt_naive.replace(tzinfo=est_tz)
                     
                     # Logic to handle year boundaries (e.g. Processing Dec data in Jan)
                     now_utc = datetime.now(timezone.utc)
@@ -428,6 +430,26 @@ class ElonAnalyticsEngine:
             out += f"\n[{name}]\n"
             out += f"Current: {current_total} | Rem: {remaining_hours:.1f}h\n"
             out += f"Rate (72h): {rate:.2f}/hr -> Pred: {int(final_pred)} ({r_str})\n"
+
+            # --- DAILY BREAKDOWN (5 PM - 5 PM Cycle) ---
+            subset_df = self.df[mask].copy()
+            if not subset_df.empty:
+                # Calculate Day Number (0 = Day 1, etc.) relative to market start
+                # This aligns perfectly with the 5pm start time if the market started then
+                subset_df['market_day'] = ((subset_df['created_at'] - start_utc).dt.total_seconds() // 86400).astype(int)
+                
+                daily_counts = subset_df.groupby('market_day').size()
+                
+                out += "📅 Daily Counts (Cycle Aligned):\n"
+                for day_idx in sorted(daily_counts.index):
+                    count = daily_counts[day_idx]
+                    # Calculate date label for this day (converted to EST for readability)
+                    day_start = start_utc + timedelta(days=day_idx)
+                    day_start_est = day_start.astimezone(timezone(timedelta(hours=TIMEZONE_OFFSET)))
+                    
+                    d_label = day_start_est.strftime('%b %d')
+                    out += f"  Day {day_idx+1} ({d_label}): {count}\n"
+
         return out
 
     # --- ALGORITHM 2: BURST MODE (CEILING) ---
