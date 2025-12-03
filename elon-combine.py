@@ -1,5 +1,5 @@
 import discord
-from discord.ext import tasks, commands
+from discord.ext import tasks
 import pandas as pd
 import numpy as np
 import requests
@@ -18,18 +18,17 @@ OLD_DATA_URL = "https://www.xtracker.io/api/download"
 
 # Config
 TARGET_HANDLE = "elonmusk"
-TIMEZONE_OFFSET = -5  # EST
-TIMEZONE_OFFSET_MYT = 8 # MYT (GMT+8)
-FORCE_YEAR = 2025 
+TIMEZONE_OFFSET = -5  # EST (New York)
+TIMEZONE_OFFSET_MYT = 8 # MYT (Malaysia/China)
 
 # --- DISCORD CONFIG ---
+# REPLACE THESE VALUES
 DISCORD_TOKEN = 'YOUR_DISCORD_BOT_TOKEN_HERE' 
 CHANNEL_ID = 123456789012345678
 
 class ElonAnalyticsEngine:
     """
-    Master Predictor Engine v3.4 (Cycle Alignment)
-    Features: Aligns daily counts to Market Start Time (e.g. 5pm-5pm UTC) for 100% accuracy.
+    Master Predictor Engine v4.0 (Mean Reversion & Decay)
     """
     def __init__(self):
         self.df = None
@@ -49,18 +48,14 @@ class ElonAnalyticsEngine:
         
         self.active_markets = {}
         
-        self.hourly_stats = {}
-        self.behavior_matrix = {}
-        self.hourly_stats_recent = {} 
-        self.behavior_matrix_recent = {} 
+        # --- Stats Containers ---
+        # Stores the relative weight of each hour (0-23). 1.0 = Average, 2.0 = Double Average.
+        self.hourly_seasonality = {} 
+        self.long_term_rate = 0.0    # 30-day baseline (tweets/hr)
+        self.medium_term_rate = 0.0  # 72h baseline (tweets/hr)
+        self.short_term_rate = 0.0   # 6h baseline (tweets/hr)
         
-        self.velocity_6h = 0.0
-        self.velocity_24h = 0.0
-        self.velocity_72h = 0.0
-        self.daily_std_dev = 0
-
-    def log(self, text):
-        return text + "\n"
+        self.daily_std_dev = 0.0
 
     def update_time(self):
         self.now_utc = datetime.now(timezone.utc)
@@ -70,85 +65,132 @@ class ElonAnalyticsEngine:
     def parse_iso_date(self, date_str):
         if not date_str: return None
         try:
+            # Handle standard ISO format from API
             dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
             return dt
         except Exception:
             try:
+                # Fallback for milliseconds
                 dt = datetime.strptime(date_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
                 return dt.replace(tzinfo=timezone.utc)
             except:
                 return None
 
     def parse_csv_date(self, date_str):
+        """
+        Intelligent date parser that avoids hardcoded years.
+        Infers year based on current date if missing.
+        """
         if not isinstance(date_str, str) or len(date_str) < 5: return None
         try:
+            # Clean string
             clean_str = re.sub(r'\s+[A-Z]{3}\s*$', '', date_str).strip()
-            if str(FORCE_YEAR) not in clean_str:
-                clean_str_with_year = f"{clean_str}, {FORCE_YEAR}"
-                dt = datetime.strptime(clean_str_with_year, '%b %d, %I:%M:%S %p, %Y')
-            else:
-                try: dt = datetime.strptime(clean_str, '%Y-%m-%d %H:%M:%S')
-                except: dt = datetime.strptime(clean_str, '%b %d, %Y, %I:%M:%S %p')
             
-            est_tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
-            dt = dt.replace(tzinfo=est_tz)
-            return dt.astimezone(timezone.utc)
+            # 1. Check if year exists in string
+            if re.search(r'\d{4}', clean_str):
+                # Try standard formats with Year
+                formats = ['%Y-%m-%d %H:%M:%S', '%b %d, %Y, %I:%M:%S %p', '%Y-%m-%dT%H:%M:%S']
+                for fmt in formats:
+                    try:
+                        dt = datetime.strptime(clean_str, fmt)
+                        # Assume input is EST if naive, then convert to UTC
+                        est_tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=est_tz)
+                        return dt.astimezone(timezone.utc)
+                    except: continue
+            else:
+                # 2. Handle "May 15, 10:00 PM" format (Missing Year)
+                try:
+                    dt_naive = datetime.strptime(clean_str, '%b %d, %I:%M:%S %p')
+                    current_year = datetime.now().year
+                    
+                    # Try current year
+                    dt = dt_naive.replace(year=current_year)
+                    est_tz = timezone(timedelta(hours=TIMEZONE_OFFSET))
+                    dt = dt.replace(tzinfo=est_tz)
+                    
+                    # Logic to handle year boundaries (e.g. Processing Dec data in Jan)
+                    now_utc = datetime.now(timezone.utc)
+                    diff_days = (dt.astimezone(timezone.utc) - now_utc).days
+                    
+                    if diff_days > 180: # Date is too far in future, must be previous year
+                        dt = dt.replace(year=current_year - 1)
+                    elif diff_days < -360: # Date is too far in past, might be next year (rare)
+                        dt = dt.replace(year=current_year + 1)
+                        
+                    return dt.astimezone(timezone.utc)
+                except: pass
+            
+            return None
         except Exception:
             return None
 
     def validate_market_integrity(self, title, api_start_dt):
+        """Checks if market Title matches the API dates (Sanity Check)"""
         try:
             months = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
             pattern = r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*(?:\s+(\d{1,2}))?'
             matches = re.findall(pattern, title, re.IGNORECASE)
             if not matches: return True
+            
             month_str, day_str = matches[0]
             month_idx = months.get(month_str.lower()[:3])
             if not month_idx: return True
+            
             day_idx = int(day_str) if day_str else 1
             api_date = api_start_dt.date()
             base_year = api_start_dt.year
+            
             candidates = []
             for y_offset in [-1, 0, 1]:
                 try:
-                    candidate = api_start_dt.replace(year=base_year + y_offset, month=month_idx, day=day_idx, hour=0, minute=0, second=0, microsecond=0).date()
+                    candidate = api_start_dt.replace(year=base_year + y_offset, month=month_idx, day=day_idx).date()
                     candidates.append(abs((api_date - candidate).days))
                 except ValueError: continue
+            
             min_diff = min(candidates) if candidates else 0
+            # If date in Title is > 5 days different from API start date, flag it
             if min_diff > 5: return False
             return True
         except Exception: return True
 
     def check_market_warning(self, title, api_start_dt):
         if not self.validate_market_integrity(title, api_start_dt):
-            print(f"⚠️ Metadata Warning: '{title}' dates might be mismatched, but tracking anyway (Active=True).")
+            print(f"⚠️ Metadata Warning: '{title}' dates might be mismatched. Tracking anyway.")
 
     def fetch_and_archive_market(self, market_id, title, start_dt, end_dt):
+        """Downloads historical data from closed markets to build better stats."""
         url = f"{TRACKING_API_BASE}/{market_id}?includeStats=true"
         headers = {'User-Agent': 'Mozilla/5.0'}
         try:
             resp = requests.get(url, headers=headers, timeout=15)
             if resp.status_code != 200: return
+            
             data = resp.json().get('data', {})
             stats = data.get('stats', {})
             hourly_buckets = stats.get('daily', [])
+            
             new_rows = []
             for bucket in hourly_buckets:
                 date_str = bucket.get('date')
                 count = int(bucket.get('count', 0))
+                
                 if count > 0 and date_str:
                     base_dt = self.parse_iso_date(date_str)
                     if base_dt and (start_dt <= base_dt <= end_dt):
+                        # Interpolate tweets evenly across the hour
                         interval = 3600 / count
                         for i in range(count):
                             tweet_dt = base_dt + timedelta(seconds=i*interval)
                             syn_id = f"hist_{market_id}_{int(tweet_dt.timestamp())}_{i}"
-                            # Strict String ID
                             new_rows.append({'id': str(syn_id).strip(), 'created_at': tweet_dt})
+                            
             if new_rows:
                 df_new = pd.DataFrame(new_rows)
                 file_exists = os.path.exists(self.history_csv)
                 df_new.to_csv(self.history_csv, mode='a', header=not file_exists, index=False)
+                
                 with open(self.archived_markets_file, 'a') as f: f.write(f"{market_id}\n")
                 self.archived_ids.add(market_id)
         except Exception: pass
@@ -168,18 +210,18 @@ class ElonAnalyticsEngine:
                 
                 rows = []
                 csv_reader = csv.reader(io.StringIO(resp.text))
-                next(csv_reader, None)
+                next(csv_reader, None) # Skip header
                 for row in csv_reader:
                     if not row: continue
                     t_id = row[0]
                     t_date = None
+                    # Try to find date column
                     for cell in row:
                         parsed = self.parse_csv_date(cell)
                         if parsed:
                             t_date = parsed
                             break
                     if t_id and t_date:
-                        # Normalize IDs to String here
                         rows.append({'id': str(t_id).strip(), 'created_at': t_date})
                 return pd.DataFrame(rows)
             return pd.DataFrame()
@@ -202,9 +244,11 @@ class ElonAnalyticsEngine:
                     start_str = t.get('startDate')
                     end_str = t.get('endDate')
                     is_active = t.get('isActive')
+                    
                     if title and tid and start_str and end_str:
                         s_dt = self.parse_iso_date(start_str)
                         e_dt = self.parse_iso_date(end_str)
+                        
                         if s_dt and e_dt:
                             if is_active:
                                 self.check_market_warning(title, s_dt)
@@ -223,25 +267,30 @@ class ElonAnalyticsEngine:
                                         self.fetch_and_archive_market(tid, title, s_dt, e_dt)
         except Exception: pass
 
-        # 2. Fetch Live Tweets
+        # 2. Fetch Live Tweets (Recent)
         df_live = pd.DataFrame()
         try:
+            # Fetch 2 days into future to catch edge cases, look back 60 days
             end_date_str = (self.now_utc + timedelta(days=2)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-            params = {'startDate': '2025-11-01T04:00:00.000Z', 'endDate': end_date_str}
+            start_date_str = (self.now_utc - timedelta(days=60)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            
+            params = {'startDate': start_date_str, 'endDate': end_date_str}
             p_resp = requests.get(POSTS_API_URL, headers=headers, params=params, timeout=25)
+            
             if p_resp.status_code == 200:
                 posts_list = p_resp.json().get('data', {}).get('posts', [])
                 if isinstance(p_resp.json().get('data'), list): posts_list = p_resp.json().get('data')
+                
                 live_rows = []
                 for p in posts_list:
                     if p.get('id') and p.get('createdAt'):
                         dt = self.parse_iso_date(p['createdAt'])
                         if dt: 
-                            # Strict String ID
                             live_rows.append({'id': str(p['id']).strip(), 'created_at': dt})
                 df_live = pd.DataFrame(live_rows)
                 if not df_live.empty: df_live.to_csv(self.live_csv, index=False)
             else:
+                # Load cache
                 if os.path.exists(self.live_csv):
                     df_live = pd.read_csv(self.live_csv, dtype={'id': str})
                     df_live['created_at'] = pd.to_datetime(df_live['created_at'], utc=True)
@@ -266,7 +315,8 @@ class ElonAnalyticsEngine:
                 df_hist['created_at'] = pd.to_datetime(df_hist['created_at'], utc=True)
             except: pass
 
-        # 5. SMART MERGE
+        # 5. SMART MERGE STRATEGY
+        # Overlap prevention: Live > Old > Hist
         if not df_live.empty:
             min_live = df_live['created_at'].min()
             if not df_old.empty: df_old = df_old[df_old['created_at'] < min_live]
@@ -280,12 +330,12 @@ class ElonAnalyticsEngine:
         if not full_df.empty:
             full_df.sort_values('created_at', inplace=True)
             
-            # FINAL DEDUPLICATION
             pre_len = len(full_df)
             full_df.drop_duplicates(subset=['id'], inplace=True)
             post_len = len(full_df)
             
             self.df = full_df
+            # Create EST column for hour calculations
             self.df['est_time'] = self.df['created_at'].dt.tz_convert(timezone(timedelta(hours=TIMEZONE_OFFSET)))
             
             print(f"✅ Merged {post_len} tweets (Dropped {pre_len - post_len} duplicates).")
@@ -298,33 +348,43 @@ class ElonAnalyticsEngine:
         self.df['hour'] = self.df['est_time'].dt.hour
         self.df['dow'] = self.df['est_time'].dt.dayofweek
         
-        start_recent = self.now_est - timedelta(days=14)
-        df_recent = self.df[self.df['est_time'] >= start_recent].copy()
-        if df_recent.empty: df_recent = self.df 
-            
-        unique_days_recent = max(1, df_recent['est_time'].dt.date.nunique())
-        hourly_counts = df_recent.groupby('hour').size()
-        self.hourly_stats_recent = {h: hourly_counts.get(h, 0) / unique_days_recent for h in range(24)}
+        # --- 1. Long Term Baseline (30 Days) ---
+        start_30d = self.now_est - timedelta(days=30)
+        df_30d = self.df[self.df['est_time'] >= start_30d].copy()
         
-        matrix_raw = df_recent.groupby(['dow', 'hour']).size()
-        total_recent_tweets = len(df_recent)
-        self.behavior_matrix_recent = (matrix_raw / max(1, total_recent_tweets)).to_dict()
+        if df_30d.empty: df_30d = self.df
         
+        # Calculate Base Rate (Tweets/Hour) over 30 days
+        hours_in_30d = (self.now_est - df_30d['est_time'].min()).total_seconds() / 3600
+        self.long_term_rate = len(df_30d) / max(1, hours_in_30d)
+        
+        # --- 2. Seasonality (Hourly Heatmap) ---
+        # Normalize so average hour = 1.0
+        hourly_counts = df_30d.groupby('hour').size()
+        total_counts = hourly_counts.sum()
+        
+        self.hourly_seasonality = {}
+        for h in range(24):
+            count = hourly_counts.get(h, 0)
+            prob = count / max(1, total_counts)
+            # Weight = Probability / (1/24)
+            weight = prob / (1/24.0) 
+            self.hourly_seasonality[h] = weight
+
+        # --- 3. Velocity Vectors (Momentum) ---
+        start_72h = self.now_est - timedelta(hours=72)
+        start_6h = self.now_est - timedelta(hours=6)
+        
+        df_72h = self.df[self.df['est_time'] >= start_72h]
+        df_6h = self.df[self.df['est_time'] >= start_6h]
+        
+        self.medium_term_rate = len(df_72h) / 72.0
+        self.short_term_rate = len(df_6h) / 6.0
+        
+        # --- 4. Volatility (Std Dev of Daily Counts) ---
         daily_counts = self.df.groupby(self.df['est_time'].dt.date).size()
         self.daily_std_dev = daily_counts.tail(30).std()
         if pd.isna(self.daily_std_dev): self.daily_std_dev = 5.0
-        
-        start_6h = self.now_est - timedelta(hours=6)
-        start_24h = self.now_est - timedelta(hours=24) 
-        start_72h = self.now_est - timedelta(hours=72)
-        
-        tweets_6h = len(self.df[self.df['est_time'] >= start_6h])
-        tweets_24h = len(self.df[self.df['est_time'] >= start_24h])
-        tweets_72h = len(self.df[self.df['est_time'] >= start_72h])
-        
-        self.velocity_6h = tweets_6h / 6.0
-        self.velocity_24h = tweets_24h / 24.0
-        self.velocity_72h = tweets_72h / 72.0
 
     def get_market_windows(self):
         return self.active_markets
@@ -334,16 +394,11 @@ class ElonAnalyticsEngine:
         if duration_hours > 480: # Monthly
             if v < 20: return "< 20", 0, 19
             if v >= 1400: return "1400+", 1400, 9999
-            if v < 600:
-                base = 20; step = 20
-                bucket_idx = (v - base) // step
-                low = base + (bucket_idx * step)
-                return f"{low}–{low+step-1}", low, low+step-1
-            else:
-                base = 600; step = 40
-                bucket_idx = (v - base) // step
-                low = base + (bucket_idx * step)
-                return f"{low}–{low+step-1}", low, low+step-1
+            base = 600 if v >= 600 else 20
+            step = 40 if v >= 600 else 20
+            bucket_idx = (v - base) // step
+            low = base + (bucket_idx * step)
+            return f"{low}–{low+step-1}", low, low+step-1
         else: # Weekly
             if v < 20: return "< 20", 0, 19
             if v >= 500: return "500+", 500, 9999
@@ -352,175 +407,180 @@ class ElonAnalyticsEngine:
             low = base + (bucket_idx * step)
             return f"{low}–{low+step-1}", low, low+step-1
 
-    # --- ALGORITHM 1 ---
+    # --- ALGORITHM 1: LINEAR BASELINE ---
     def run_algo_v1(self):
         out = "=== ALGORITHM 1: LINEAR BASELINE ===\n"
         markets = self.get_market_windows()
         if not markets: return out + "No active markets found."
-
+        
         for name, (start_utc, end_utc) in markets.items():
             mask = (self.df['created_at'] >= start_utc) & (self.df['created_at'] <= self.now_utc)
             current_total = len(self.df[mask])
-            elapsed_hours = (self.now_utc - start_utc).total_seconds() / 3600
             remaining_hours = max(0, (end_utc - self.now_utc).total_seconds() / 3600)
             total_duration = (end_utc - start_utc).total_seconds() / 3600
             
-            rate = current_total / elapsed_hours if elapsed_hours > 0 else 0
+            # Use 72h rate (Medium Term)
+            rate = self.medium_term_rate 
             final_pred = current_total + (rate * remaining_hours)
             
             r_str, _, _ = self.get_market_bracket(final_pred, total_duration)
             out += f"\n[{name}]\n"
-            out += f"Current: {current_total} | Remaining: {remaining_hours:.1f}h\n"
-            out += f"Pace: {rate:.2f}/hr -> Prediction: {int(final_pred)} (Bet: {r_str})\n"
-            
-            # --- FIXED DAILY BREAKDOWN LOGIC ---
-            # Group by 24h cycles relative to Market Start
-            subset_df = self.df[mask].copy()
-            if not subset_df.empty:
-                # Calculate Day Number (0 = Day 1, 1 = Day 2, etc.)
-                subset_df['market_day'] = ((subset_df['created_at'] - start_utc).dt.total_seconds() // 86400).astype(int)
-                
-                daily_counts = subset_df.groupby('market_day').size()
-                
-                out += "📅 Daily Breakdown (Cycle-Aligned):\n"
-                for day_idx, count in daily_counts.items():
-                    # Calculate date label for this day
-                    day_start = start_utc + timedelta(days=day_idx)
-                    day_end = day_start + timedelta(days=1)
-                    
-                    # Formatting
-                    d_label = day_start.strftime('%b %d')
-                    out += f"  Day {day_idx+1} ({d_label}): {count}\n"
+            out += f"Current: {current_total} | Rem: {remaining_hours:.1f}h\n"
+            out += f"Rate (72h): {rate:.2f}/hr -> Pred: {int(final_pred)} ({r_str})\n"
         return out
 
-    # --- ALGORITHM 2 ---
+    # --- ALGORITHM 2: BURST MODE (CEILING) ---
     def run_algo_v2(self):
-        out = "=== ALGORITHM 2: ADAPTIVE VELOCITY ===\n"
+        """
+        Assumes the current 'Short Term' mania (6h rate) continues unabated.
+        Useful for calculating the upper bound of possibilities.
+        """
+        out = "=== ALGORITHM 2: BURST CEILING (MAX) ===\n"
         markets = self.get_market_windows()
         if not markets: return out + "Waiting..."
 
-        sorted_hours = sorted(self.hourly_stats_recent.items(), key=lambda x: x[1], reverse=True)
-        top_hours = [f"{h:02d}:00" for h, val in sorted_hours[:3]]
-        
-        is_burst = self.velocity_6h > (self.velocity_72h * 1.5)
-        burst_status = "🚨 BURST MODE" if is_burst else "✅ Stable"
-        
-        current_hour = self.now_est.hour
-        avg_now = self.hourly_stats_recent.get(current_hour, 0)
-        
-        out += f"Status: {burst_status}\n"
-        out += f"Speed (6h): {self.velocity_6h:.2f}/hr | Speed (3d): {self.velocity_72h:.2f}/hr\n"
-        out += f"⚡ Recent Peak Hours: {', '.join(top_hours)}\n"
+        burst_rate = max(self.short_term_rate, self.medium_term_rate)
+        out += f"Burst Speed: {burst_rate:.2f}/hr (Assuming no sleep)\n"
 
         for name, (start_utc, end_utc) in markets.items():
             mask = (self.df['created_at'] >= start_utc) & (self.df['created_at'] <= self.now_utc)
             current_total = len(self.df[mask])
-            remaining_hours = max(0, (end_utc - self.now_utc).total_seconds() / 3600)
-            total_duration = (end_utc - start_utc).total_seconds() / 3600
-
-            if is_burst:
-                blended_rate = (self.velocity_6h * 0.7) + (self.velocity_72h * 0.3)
-            else:
-                blended_rate = (self.velocity_6h * 0.3) + (self.velocity_72h * 0.7)
             
-            accumulated = 0
             sim_time = self.now_est
             end_est = end_utc.astimezone(timezone(timedelta(hours=TIMEZONE_OFFSET)))
-            global_recent_avg = sum(self.hourly_stats_recent.values()) / 24.0
-            if global_recent_avg == 0: global_recent_avg = 1.0 
             
+            accumulated = 0
             while sim_time < end_est:
-                next_hour = sim_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-                if next_hour > end_est: next_hour = end_est
-                fraction = (next_hour - sim_time).total_seconds() / 3600.0
-                
-                hour_val = self.hourly_stats_recent.get(sim_time.hour, global_recent_avg)
-                activity_multiplier = hour_val / global_recent_avg
-                
-                accumulated += (blended_rate * activity_multiplier * fraction)
-                sim_time = next_hour
+                # Apply Seasonality to the Burst Rate
+                # Even in mania, he tweets less at 4 AM than 4 PM
+                weight = self.hourly_seasonality.get(sim_time.hour, 1.0)
+                expected = burst_rate * weight
+                accumulated += expected
+                sim_time += timedelta(hours=1)
             
             final_pred = current_total + accumulated
-            r_str, _, _ = self.get_market_bracket(final_pred, total_duration)
-            
+            r_str, _, _ = self.get_market_bracket(final_pred, (end_utc-start_utc).total_seconds()/3600)
             out += f"\n[{name}]\n"
-            out += f"Final: {int(final_pred)} (Bet: {r_str})\n"
+            out += f"Max Ceiling: {int(final_pred)} ({r_str})\n"
         return out
 
-    # --- ALGORITHM 3 ---
+    # --- ALGORITHM 3: MEAN REVERSION DECAY (REALISTIC) ---
     def run_algo_v3(self):
-        out = "=== ALGORITHM 3: PROBABILISTIC ===\n"
+        """
+        The Smart Algorithm.
+        Blends Current Momentum -> Long Term Average over 48 hours.
+        Captures the 'crash' after a tweet storm.
+        """
+        out = "=== ALGORITHM 3: MEAN REVERSION DECAY (SMART) ===\n"
         markets = self.get_market_windows()
         if not markets: return out + "Data insufficient."
 
-        out += f"Volatility: +/- {self.daily_std_dev:.1f}\n"
+        out += f"Long Term Base (30d): {self.long_term_rate:.2f}/hr\n"
+        out += f"Current Speed (72h): {self.medium_term_rate:.2f}/hr\n"
+        
+        # Momentum Ratio: How manic is he?
+        momentum_ratio = self.medium_term_rate / max(0.1, self.long_term_rate)
         
         for name, (start_utc, end_utc) in markets.items():
             mask = (self.df['created_at'] >= start_utc) & (self.df['created_at'] <= self.now_utc)
             current_total = len(self.df[mask])
-            remaining_hours = max(0, (end_utc - self.now_utc).total_seconds() / 3600)
-            total_duration = (end_utc - start_utc).total_seconds() / 3600
             
-            current_intensity = self.velocity_72h
-            proj_add = 0
-            temp_t = self.now_est
+            sim_time = self.now_est
             end_est = end_utc.astimezone(timezone(timedelta(hours=TIMEZONE_OFFSET)))
-            BASE_PROB = 0.00595
             
-            while temp_t < end_est:
-                k = (temp_t.weekday(), temp_t.hour)
-                prob = self.behavior_matrix_recent.get(k, BASE_PROB)
-                multiplier = prob / BASE_PROB
-                expected_tweets = current_intensity * multiplier
-                proj_add += expected_tweets
-                temp_t += timedelta(hours=1)
+            accumulated_tweets = 0
+            hours_simulated = 0
             
-            final_pred = current_total + proj_add
-            days_rem = remaining_hours / 24
-            margin = self.daily_std_dev * np.sqrt(max(days_rem, 0.5))
+            # REVERSION SETTINGS
+            # He usually maintains mania for 2-3 days max before crashing
+            reversion_window_hours = 48.0 
+            
+            while sim_time < end_est:
+                hours_simulated += 1
+                
+                # 1. Linear Decay Calculation
+                decay_factor = min(1.0, hours_simulated / reversion_window_hours)
+                
+                # Blend: Start at Medium Term, slide to Long Term
+                hourly_base = (self.medium_term_rate * (1 - decay_factor)) + (self.long_term_rate * decay_factor)
+                
+                # 2. Apply Hourly Seasonality (Sleep cycles)
+                seasonality_multiplier = self.hourly_seasonality.get(sim_time.hour, 1.0)
+                
+                # 3. Add to total
+                expected = hourly_base * seasonality_multiplier
+                accumulated_tweets += expected
+                
+                sim_time += timedelta(hours=1)
+
+            final_pred = current_total + accumulated_tweets
+            
+            # Confidence Interval Strategy
+            days_rem = hours_simulated / 24
+            # Widen margins if he is manic (High Momentum = High Volatility)
+            vol_multiplier = 1.0 + (0.15 * max(0, momentum_ratio - 1.0))
+            
+            margin = (self.daily_std_dev * np.sqrt(max(days_rem, 0.5))) * vol_multiplier
+            
             safe_min = final_pred - margin
             safe_max = final_pred + margin
 
-            range_str, p_low, p_high = self.get_market_bracket(final_pred, total_duration)
-            u_label, u_low, u_high = self.get_market_bracket(safe_max, total_duration)
-            l_label, l_low, l_high = self.get_market_bracket(safe_min, total_duration)
+            range_str, p_low, p_high = self.get_market_bracket(final_pred, (end_utc-start_utc).total_seconds()/3600)
+            u_label, u_low, u_high = self.get_market_bracket(safe_max, (end_utc-start_utc).total_seconds()/3600)
+            l_label, l_low, l_high = self.get_market_bracket(safe_min, (end_utc-start_utc).total_seconds()/3600)
 
             out += f"\n[{name}]\n"
             out += f"Projected: {int(final_pred)} (Range: {int(safe_min)}-{int(safe_max)})\n"
-            out += f"PRIMARY: {range_str}\n"
+            out += f"PRIMARY BET: {range_str}\n"
             
-            hedges = []
-            if u_low > p_high: hedges.append(f"UPPER HEDGE: {u_label}")
-            if l_high < p_low: hedges.append(f"LOWER HEDGE: {l_label}")
-            if hedges: out += "HEDGING:\n" + "\n".join(hedges)
-            else: out += "ADVICE: Strong conviction."
-            out += "\n"
+            # Hedging Logic
+            if u_low > p_high: out += f"HEDGE UP: {u_label}\n"
+            if l_high < p_low: out += f"HEDGE DOWN: {l_label}\n"
+
         return out
 
-    # --- ALGORITHM 4 ---
+    # --- ALGORITHM 4: ALPHA SCANNER ---
     def run_algo_v4(self):
-        out = "=== ALGORITHM 4: ALPHA SCANNER ===\n"
-        start_7d = self.now_est - timedelta(days=7)
-        tweets_7d = len(self.df[self.df['est_time'] >= start_7d])
-        rate_7d = tweets_7d / (24*7)
-        rate_24h = self.velocity_24h
-        ratio = rate_24h / rate_7d if rate_7d > 0 else 1.0
+        out = "=== ALGORITHM 4: MOMENTUM CHECK ===\n"
+        ratio = self.medium_term_rate / max(0.1, self.long_term_rate)
         
-        out += f"7-Day Baseline: {rate_7d:.2f}/hr\n"
-        out += f"24-Hour Speed: {rate_24h:.2f}/hr\n"
         out += f"Momentum Ratio: {ratio:.2f}x\n"
+        if ratio > 1.3: out += "⚠️ WARNING: Activity is Unsustainably High (Expect Reversion Down)\n"
+        elif ratio < 0.7: out += "💤 NOTE: Activity is Low (Expect Reversion Up)\n"
+        else: out += "✅ Activity is Normal.\n"
         
-        projected_next_week = rate_24h * 168 
-        range_str, _, _ = self.get_market_bracket(projected_next_week, 168)
+        return out
         
-        out += f"🚀 NEXT WEEK TARGET: {int(projected_next_week)} ({range_str})\n"
+    # --- ALGORITHM 5: NEXT WEEK PRE-RUNNER ---
+    def run_algo_v5(self):
+        out = "=== ALGORITHM 5: NEXT WEEK PRE-RUNNER (ALPHA) ===\n"
         
-        if ratio > 1.2: out += "STRATEGY: 📈 BULLISH. Accelerating.\n"
-        elif ratio < 0.8: out += "STRATEGY: 📉 BEARISH. Decelerating.\n"
-        else: out += "STRATEGY: ⚖️ NEUTRAL. Steady state.\n"
+        # 1. Project based on current 72h momentum (The "Hot" Hand)
+        proj_momentum = self.medium_term_rate * 168
+        
+        # 2. Project based on 30d baseline (The "Safe" Hand)
+        proj_baseline = self.long_term_rate * 168
+        
+        # 3. Determine target
+        # If momentum is high, the market often underestimates the continuation
+        target = (proj_momentum * 0.7) + (proj_baseline * 0.3) # Weighted blend
+        
+        range_str, low, high = self.get_market_bracket(target, 168)
+        
+        out += f"Current 72h Trend Projects: {int(proj_momentum)} tweets/week\n"
+        out += f"30d Baseline Projects: {int(proj_baseline)} tweets/week\n"
+        out += f"🎯 FAIR VALUE TARGET: {int(target)} ({range_str})\n"
+        
+        if proj_momentum > proj_baseline * 1.2:
+            out += "Strategy: MOMENTUM PLAY. Buy brackets slightly above current average.\n"
+        elif proj_momentum < proj_baseline * 0.8:
+            out += "Strategy: REVERSION PLAY. Buy brackets lower than current perception.\n"
+        else:
+            out += "Strategy: NEUTRAL. Accumulate middle brackets.\n"
+            
         return out
 
-# --- CLIENT ---
+# --- DISCORD CLIENT ---
 class ElonPredictorBot(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -534,10 +594,14 @@ class ElonPredictorBot(discord.Client):
     @tasks.loop(minutes=15)
     async def monitor_task(self):
         channel = self.get_channel(CHANNEL_ID)
-        if not channel: return
+        if not channel: 
+            print("Channel not found. Check CHANNEL_ID.")
+            return
+            
         print("Running Analysis Cycle...")
-        try: await channel.purge(limit=100)
+        try: await channel.purge(limit=10) # Clean up previous messages
         except Exception: pass
+        
         self.engine.update_time()
         self.engine.refresh_data()
         
@@ -547,16 +611,17 @@ class ElonPredictorBot(discord.Client):
         report_v2 = self.engine.run_algo_v2()
         report_v3 = self.engine.run_algo_v3()
         report_v4 = self.engine.run_algo_v4()
+        report_v5 = self.engine.run_algo_v5()
         
         ts_est = self.engine.now_est.strftime('%Y-%m-%d %H:%M EST')
-        ts_myt = self.engine.now_myt.strftime('%H:%M MYT')
         
         try:
-            await channel.send(f"**🚀 Elon Prediction Update - {ts_est} | {ts_myt}**")
+            await channel.send(f"**🚀 Elon Prediction Update - {ts_est}**")
             await channel.send(f"```yaml\n{report_v1}\n```")
             await channel.send(f"```yaml\n{report_v2}\n```")
             await channel.send(f"```yaml\n{report_v3}\n```")
             await channel.send(f"```yaml\n{report_v4}\n```")
+            await channel.send(f"```yaml\n{report_v5}\n```")
             print("Reports sent.")
         except Exception as e: print(f"Error sending: {e}")
 
