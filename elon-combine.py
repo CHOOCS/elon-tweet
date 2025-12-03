@@ -25,6 +25,7 @@ TIMEZONE_OFFSET_MYT = 8 # MYT (Malaysia/China)
 # REPLACE THESE VALUES
 DISCORD_TOKEN = 'YOUR_DISCORD_BOT_TOKEN_HERE' 
 CHANNEL_ID = 123456789012345678
+UPDATE_INTERVAL_MINUTES = 15 # Set this to 1, 5, or 15 to change update frequency
 
 class ElonAnalyticsEngine:
     """
@@ -591,7 +592,7 @@ class ElonPredictorBot(discord.Client):
         if not self.monitor_task.is_running():
             self.monitor_task.start()
 
-    @tasks.loop(minutes=15)
+    @tasks.loop(minutes=UPDATE_INTERVAL_MINUTES)
     async def monitor_task(self):
         channel = self.get_channel(CHANNEL_ID)
         if not channel: 
